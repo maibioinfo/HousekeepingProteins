@@ -1,0 +1,210 @@
+---
+title: "Alpha Cell - Housekeeping proteome"
+author: "Mai Nguyen"
+date: "2025-02-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Import functions
+source('C:/Users/maihu/OneDrive/Desktop/Master/thesis/scripts/functions.R')
+# Import required lib
+library(data.table)
+library(tidyr)
+library(dplyr)
+library(umap)
+library(ggplot2)
+library(FactoMineR)
+library(factoextra)
+library(tibble)
+library(purrr)
+library(clusterProfiler)
+library(org.Hs.eg.db)  
+library(DOSE) 
+# Set seed
+set.seed(30)
+```
+
+## Read data
+
+Read 4 transcriptomics data sets: singe-cell types, cell linez, brain cells, immune cells
+
+```{r read data}
+# Pre-processing 
+# Read data
+hpa_rna_single_cell = read_data('data/rna_single_cell_type.tsv')
+hpa_rna_brain = read_data('data/rna_single_nuclei_cluster_type.tsv')
+hpa_rna_immune = read_data('data/rna_immune_cell.tsv')
+hpa_rna_cell_line = read_data('data/rna_celline.tsv')
+
+# Convert data to wide format
+hpa_rna_single_cell_wide = reshape_wide(hpa_rna_single_cell, 'Cell.type')
+hpa_rna_brain_wide = reshape_wide(hpa_rna_brain, 'Cluster.type')
+hpa_rna_immune_wide = reshape_wide(hpa_rna_immune, 'Immune.cell')
+hpa_rna_cell_line_wide = reshape_wide(hpa_rna_cell_line, 'Cell.line')
+
+# Convert data to long format
+hpa_rna_single_cell_long = reshape_long(hpa_rna_single_cell_wide)
+hpa_rna_brain_long = reshape_long(hpa_rna_brain_wide)
+hpa_rna_immune_long = reshape_long(hpa_rna_immune_wide)
+hpa_rna_cell_line_long = reshape_long(hpa_rna_cell_line_wide)
+```
+
+## Quality control
+
+Plot data set onto UMAP and PCA for quality check. There was no significant outliers were detected
+
+```{r umap, pca}
+# UMAP 
+# Single cell data
+umap_single_results = compute_umap(hpa_rna_single_cell_long, 'Single cell data')
+umap_single_xy = umap_single_results$umap_xy 
+umap_single_results$umap_plot
+
+# Brain data
+umap_brain_results = compute_umap(hpa_rna_brain_long, 'Brain data')
+umap_brain_xy = umap_brain_results$umap_xy 
+umap_brain_results$umap_plot
+
+# Immune data
+umap_immune_results = compute_umap(hpa_rna_immune_long, 'Immune data')
+umap_immune_xy = umap_immune_results$umap_xy 
+umap_immune_results$umap_plot
+
+# Cell line data 
+umap_celline_results = compute_umap(hpa_rna_cell_line_long, 'Cell line data')
+umap_celline_xy = umap_celline_results$umap_xy 
+umap_celline_results$umap_plot
+
+# PCA
+# Single cell
+pca_single_results = compute_pca(hpa_rna_single_cell_long, 'Single cell data')
+pca_single_results$pca_plot
+# Brain data
+pca_brain_results = compute_pca(hpa_rna_brain_long, 'Brain data')
+pca_brain_results$pca_plot
+# Immune data
+pca_immune_results = compute_pca(hpa_rna_immune_long, 'Immune data')
+pca_immune_results$pca_plot  
+# Cell line
+pca_celline_results = compute_pca(hpa_rna_cell_line_long, 'Cell line data')
+pca_celline_results$pca_plot  
+```
+
+## Always expressed analysis
+
+Identify the genes always expressed across samples in each data set. 
+
+There are two thresholds for this analysis: 
+- nTPM threshold: the minimum value of the gene expression, measured by nTPM
+- Percentage of samples satisfied the nTPM threshold (%)
+
+We tested the combination of thresholds: 
+- nTPM: >0, >= 0.2, >= 0.5, >=1
+- Percentage of samples: 95%, 98%, 100%
+
+The results were illustrated in stacked bar plots
+
+```{r always expressed}
+datasets = list(single = hpa_rna_single_cell_wide, brain = hpa_rna_brain_wide,
+  immune = hpa_rna_immune_wide, cell_line = hpa_rna_cell_line_wide)
+
+# Threshold
+ntpm_thresholds = c(0, 0.2, 0.5, 1)
+percentage_thresholds = c(100, 98, 95)
+results_list = set_names(map(ntpm_thresholds, function(ntpm) {
+    set_names(map(percentage_thresholds, function(perc) {
+      map(datasets, ~ calculate_expression_percentage(.x, ntpm, perc))
+    }), paste0('ntpm_', ntpm, '_perc_', percentage_thresholds))}), paste0('ntpm_', ntpm_thresholds))
+
+# Generate summary tables and plots
+plots = lapply(ntpm_thresholds, function(ntpm) {
+  summary_table = map_dfr(names(datasets), function(dataset) {
+    gene_counts = map_int(percentage_thresholds, ~ get_gene_counts(dataset, ntpm, .x))
+    names(gene_counts) = c('T100', 'T98', 'T95')
+    data.frame(Dataset = dataset, T100 = gene_counts['T100'], T98 = gene_counts['T98'],
+               T95 = gene_counts['T95'], Total_Genes = nrow(datasets[[dataset]]))}) %>%
+    mutate(Extra_100 = T100, Extra_98 = T98 - T100,
+      Extra_95 = T95 - T98, Extra_Less95 = Total_Genes - T95) %>%
+    select(Dataset, Extra_100, Extra_98, Extra_95, Extra_Less95, Total_Genes)
+  # Transform for stacked bar plot
+  stacked_data = summary_table %>%
+    pivot_longer(cols = starts_with('Extra'), names_to = 'Threshold', values_to = 'Gene_Count') %>%
+    mutate(Total_Genes = rep(summary_table$Total_Genes, each = 4),
+           Threshold = factor(Threshold, levels = c('Extra_Less95', 'Extra_95', 'Extra_98', 'Extra_100'),
+                              labels = c('<95%', '95%', '98%', '100%')), Percentage = (Gene_Count / Total_Genes) * 100)
+  ntpm_label = ifelse(ntpm == 0, 'nTPM > 0', paste0('nTPM ≥ ', ntpm))
+  ggplot(stacked_data, aes(x = Dataset, y = Gene_Count, fill = Threshold)) +
+    geom_bar(stat = 'identity', color = 'black') +
+    geom_text(aes(label = paste0(round(Percentage, 1), '%')),
+              position = position_stack(vjust = 0.5), size = 4, color = 'white') +
+    scale_fill_manual(name = 'Expression Threshold', 
+                      values = c('100%' = 'darkblue', '98%' = 'blue', '95%' = 'lightblue', '<95%' = 'gray')) +
+    labs(title = paste0('Always Expressed Genes Across Datasets (', ntpm_label, ')'),
+         x = 'Dataset', y = 'Number of Genes') + theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.25, size = 12, face = 'bold'))})
+
+# Display plots
+invisible(lapply(plots, print))
+```
+
+## Overlaps of "always expressed" across data sets
+
+We checked the overlaps of "always expressed" genes in all 4 data sets and see how similar the gene expression of them by plotting onto UMAp
+
+```{r overlaps}
+# Filter datasets for overlapping always-expressed genes
+overlaps_single = filter_by_list(hpa_rna_single_cell_wide, shared_genes$Gene, 'Gene')
+overlaps_brain = filter_by_list(hpa_rna_brain_wide, shared_genes$Gene, 'Gene')
+overlaps_immune = filter_by_list(hpa_rna_immune_wide, shared_genes$Gene, 'Gene')
+overlaps_celline = filter_by_list(hpa_rna_cell_line_wide, shared_genes$Gene, 'Gene')
+
+# Prepare datasets for UMAP
+overlap_always_expressed_single = prepare_for_umap(overlaps_single)
+overlap_always_expressed_brain = prepare_for_umap(overlaps_brain)
+overlap_always_expressed_immune = prepare_for_umap(overlaps_immune)
+overlap_always_expressed_celline = prepare_for_umap(overlaps_celline)
+
+# Run UMAP using the existing function
+umap_single_overlaps = compute_umap(overlap_always_expressed_single, 'Single cell data - Overlap genes expression')
+umap_brain_overlaps = compute_umap(overlap_always_expressed_brain, 'Brain data - Overlap genes expression')
+umap_immune_overlaps = compute_umap(overlap_always_expressed_immune, 'Immune data - Overlap genes expression')
+umap_celline_overlaps = compute_umap(overlap_always_expressed_celline, 'Cell line data - Overlap genes expression')
+
+# Display UMAP plots
+print(umap_single_overlaps$umap_plot)
+print(umap_brain_overlaps$umap_plot)
+print(umap_immune_overlaps$umap_plot)
+print(umap_celline_overlaps$umap_plot)
+```
+
+## Single-cell "always expressed" gene GO enrichment
+
+Only single-cell data showed two distinct clusters among "always expressed" gene profile. We enriched them separately to see if they were divided into different biological pathway
+
+```{r GO enrich}
+# Extract UMAP coordinates from the overlap UMAP analysis
+umap_overlaps_single_xy = umap_single_overlaps$umap_xy
+umap_overlaps_single_xy$Gene = rownames(overlap_always_expressed_single)
+
+# Split genes into two clusters based on UMAP2 threshold
+cluster_high = umap_overlaps_single_xy %>% filter(UMAP2 > 10) %>% pull(Gene)
+cluster_low = umap_overlaps_single_xy %>% filter(UMAP2 <= 10) %>% pull(Gene)
+
+# Convert to Entrez IDs for each cluster
+entrez_high = bitr(cluster_high, fromType = 'ENSEMBL', toType = 'ENTREZID', OrgDb = org.Hs.eg.db)
+entrez_low = bitr(cluster_low, fromType = 'ENSEMBL', toType = 'ENTREZID', OrgDb = org.Hs.eg.db)
+
+# Run GO enrichment analysis for each cluster
+go_high = enrichGO(gene = entrez_high$ENTREZID, OrgDb = org.Hs.eg.db, 
+                   keyType = 'ENTREZID', ont = 'BP', pAdjustMethod = 'BH', 
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.05)
+
+go_low = enrichGO(gene = entrez_low$ENTREZID, OrgDb = org.Hs.eg.db, 
+                  keyType = 'ENTREZID', ont = 'BP', pAdjustMethod = 'BH', 
+                  pvalueCutoff = 0.05, qvalueCutoff = 0.05)
+
+# Generate enrichment dot plots for both clusters
+dotplot(go_high, showCategory = 10, title = 'Top 10 GO terms - Single cell data - Alwasy expressed genes (1)')
+dotplot(go_low, showCategory = 10, title = 'Top 10 GO erms - Single cell data - Alwasy expressed genes (2)')
+```
